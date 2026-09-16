@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from services import storage as sqlite_storage
 
@@ -29,6 +30,41 @@ def resolve_database_path(base_dir: Path):
 
 def init_storage(target) -> None:
     _backend().init_storage(target)
+
+
+def is_transient_storage_error(exc: BaseException) -> bool:
+    checker = getattr(_backend(), "is_transient_storage_error", None)
+    return bool(checker and checker(exc))
+
+
+def init_storage_with_retry(
+    target,
+    *,
+    attempts: int = 4,
+    initial_delay_seconds: float = 2.0,
+    max_delay_seconds: float = 8.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    on_retry: Callable[[int, int, float], None] | None = None,
+) -> int:
+    """Initialize storage, retrying only recoverable cloud connection failures."""
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+
+    delay = max(0.0, float(initial_delay_seconds))
+    for attempt in range(1, attempts + 1):
+        try:
+            init_storage(target)
+            return attempt
+        except Exception as exc:
+            if attempt >= attempts or not is_transient_storage_error(exc):
+                raise
+            wait_seconds = min(delay, max(0.0, float(max_delay_seconds)))
+            if on_retry is not None:
+                on_retry(attempt, attempts, wait_seconds)
+            sleep_fn(wait_seconds)
+            delay = max(delay * 2, initial_delay_seconds)
+
+    raise RuntimeError("Storage initialization retry loop ended unexpectedly.")
 
 
 def load_employee_df(target):

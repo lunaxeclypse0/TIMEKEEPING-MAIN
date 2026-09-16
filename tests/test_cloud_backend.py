@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from services import postgres_storage, storage_backend
+from services import postgres_storage, storage as sqlite_storage, storage_backend
 from scripts.migrate_sqlite_to_supabase import load_sqlite_source_without_mutation
 
 
@@ -16,6 +16,58 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CloudStorageConfigurationTests(unittest.TestCase):
+    def test_transient_connection_errors_are_classified_through_wrappers(self) -> None:
+        transient = RuntimeError("database is starting")
+        transient.sqlstate = "57P03"
+        wrapped = RuntimeError("connection failed")
+        wrapped.__cause__ = transient
+        self.assertTrue(postgres_storage.is_transient_storage_error(wrapped))
+
+        bad_password = RuntimeError("password authentication failed")
+        bad_password.sqlstate = "28P01"
+        self.assertFalse(postgres_storage.is_transient_storage_error(bad_password))
+
+    def test_storage_initialization_retries_only_transient_failures(self) -> None:
+        transient = RuntimeError("temporary connection failure")
+        sleeps: list[float] = []
+        retry_events: list[tuple[int, int, float]] = []
+        with (
+            patch.object(
+                storage_backend,
+                "init_storage",
+                side_effect=[transient, transient, None],
+            ) as initializer,
+            patch.object(storage_backend, "is_transient_storage_error", return_value=True),
+        ):
+            completed_attempt = storage_backend.init_storage_with_retry(
+                "postgresql://unused",
+                attempts=4,
+                initial_delay_seconds=1,
+                max_delay_seconds=4,
+                sleep_fn=sleeps.append,
+                on_retry=lambda attempt, maximum, delay: retry_events.append(
+                    (attempt, maximum, delay)
+                ),
+            )
+
+        self.assertEqual(completed_attempt, 3)
+        self.assertEqual(initializer.call_count, 3)
+        self.assertEqual(sleeps, [1, 2])
+        self.assertEqual(retry_events, [(1, 4, 1), (2, 4, 2)])
+
+    def test_storage_initialization_does_not_retry_permanent_failures(self) -> None:
+        sleeps: list[float] = []
+        with (
+            patch.object(storage_backend, "init_storage", side_effect=ValueError("bad DSN")),
+            patch.object(storage_backend, "is_transient_storage_error", return_value=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "bad DSN"):
+                storage_backend.init_storage_with_retry(
+                    "invalid",
+                    sleep_fn=sleeps.append,
+                )
+        self.assertEqual(sleeps, [])
+
     def test_dispatcher_keeps_sqlite_for_local_use(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(os.environ, {"TIMEKEEPING_DATABASE_URL": ""}, clear=False):
@@ -74,7 +126,18 @@ class CloudStorageConfigurationTests(unittest.TestCase):
     def test_sqlite_migration_reader_does_not_modify_source_database(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "source.db"
-            shutil.copy2(PROJECT_ROOT / "data" / "goclinic_timekeeping.db", source)
+            fixture = PROJECT_ROOT / "data" / "goclinic_timekeeping.db"
+            if fixture.is_file():
+                shutil.copy2(fixture, source)
+            else:
+                # The real local database is intentionally gitignored. Build a
+                # representative fixture so a clean clone can run this test.
+                sqlite_storage.init_storage(source)
+                sqlite_storage.save_adjustments_df(
+                    source,
+                    sqlite_storage.default_adjustments_df(),
+                )
+                sqlite_storage.save_settings(source, {"source": "generated-test-fixture"})
             before = hashlib.sha256(source.read_bytes()).hexdigest()
             employees, adjustments, settings = load_sqlite_source_without_mutation(source)
             after = hashlib.sha256(source.read_bytes()).hexdigest()

@@ -25,6 +25,12 @@ SCHEMA = "timekeeping"
 EMPLOYEE_WRITE_LOCK = 711_202_609_060_001
 _INITIALIZED_TARGETS: set[str] = set()
 _INIT_LOCK = threading.Lock()
+_TRANSIENT_SQLSTATES = {
+    "53300",  # too_many_connections
+    "57P01",  # admin_shutdown
+    "57P02",  # crash_shutdown
+    "57P03",  # cannot_connect_now
+}
 
 
 def _driver():
@@ -69,6 +75,30 @@ def _connect(target: str):
         raise RuntimeError(
             "Could not connect to the permanent Supabase database. Check the secret connection string."
         ) from exc
+
+
+def is_transient_storage_error(exc: BaseException) -> bool:
+    """Return True for connection failures that can recover without configuration changes."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        sqlstate = getattr(current, "sqlstate", None)
+        if isinstance(sqlstate, str):
+            if sqlstate.startswith("08") or sqlstate in _TRANSIENT_SQLSTATES:
+                return True
+
+        error_type = type(current)
+        if error_type.__module__.startswith("psycopg") and error_type.__name__ in {
+            "InterfaceError",
+            "OperationalError",
+        }:
+            return True
+        if isinstance(current, (ConnectionError, TimeoutError, OSError)):
+            return True
+
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _employee_rows(conn) -> list[dict[str, Any]]:
