@@ -25,7 +25,8 @@ from services.storage_backend import (
     add_employee,
     add_employees_if_missing,
     delete_employee,
-    init_storage,
+    init_storage_with_retry,
+    is_transient_storage_error,
     list_recent_employee_changes,
     load_adjustments_df,
     load_employee_df,
@@ -83,15 +84,34 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = resolve_database_path(BASE_DIR)
 
-try:
-    init_storage(DB_PATH)
-except Exception as exc:
-    st.error(
-        "Permanent database initialization failed. Check TIMEKEEPING_DATABASE_URL "
-        "in the deployment secrets, then reboot the app."
+database_status = st.empty()
+
+
+def _show_database_retry(failed_attempt: int, max_attempts: int, delay_seconds: float) -> None:
+    database_status.warning(
+        "The database is waking up. Retrying automatically in "
+        f"{delay_seconds:g} seconds ({failed_attempt}/{max_attempts})…"
     )
-    st.caption(str(exc))
+
+
+try:
+    init_storage_with_retry(DB_PATH, on_retry=_show_database_retry)
+except Exception as exc:
+    database_status.empty()
+    if is_transient_storage_error(exc):
+        st.error("The database is still waking up after several automatic retries.")
+        st.caption("No data was changed. Wait a moment, then retry the connection.")
+        if st.button("Retry database connection", type="primary"):
+            st.rerun()
+    else:
+        st.error(
+            "Database configuration failed. Verify TIMEKEEPING_DATABASE_URL "
+            "in the Streamlit deployment secrets."
+        )
+        st.caption("The app did not modify any database records.")
     st.stop()
+else:
+    database_status.empty()
 
 
 # ── Session State Init ────────────────────────────────────────────────────────
